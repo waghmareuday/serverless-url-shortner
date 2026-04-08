@@ -1,0 +1,24 @@
+# ─── Environment Variables (CRITICAL) ───
+.env
+.env.*
+!.env.example
+
+# ─── Node Modules ───
+node_modules/
+npm-debug.log
+yarn-error.log
+frontend/dist/
+frontend/.netlify/
+
+# ─── Serverless Framework ───
+.serverless/
+
+# ─── Testing & Coverage ───
+coverage/
+.nyc_output/
+
+# ─── OS & Editor Files ───
+.DS_Store
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,98 @@
+service: url-shortener
+frameworkVersion: '3'
+useDotenv: true
+
+# ─── 1. Provider & Environment ──────────────────────────────────────────────
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ap-south-1 # Deploys to Mumbai for lowest latency
+  memorySize: 256    # 256MB is plenty and maximizes your free tier compute
+  timeout: 10        # Kills the function after 10s if it hangs (saves money)
+  httpApi:
+    cors:
+      allowedOrigins:
+        - "*"
+      allowedHeaders:
+        - Content-Type
+        - Authorization
+        - X-Test-IP
+      allowedMethods:
+        - GET
+        - POST
+        - OPTIONS
+      allowCredentials: false
+      maxAge: 86400
+  
+  environment:
+    DYNAMODB_TABLE: ${self:service}-${sls:stage}
+    ANALYTICS_QUEUE_URL: !Ref AnalyticsQueue
+    # These must be set in your terminal before deploying
+    UPSTASH_REDIS_REST_URL: ${env:UPSTASH_REDIS_REST_URL}
+    UPSTASH_REDIS_REST_TOKEN: ${env:UPSTASH_REDIS_REST_TOKEN}
+
+  # ─── 2. Security (IAM Permissions) ────────────────────────────────────────
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource: !GetAtt UrlTable.Arn
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource: !GetAtt AnalyticsQueue.Arn
+
+# ─── 3. Lambda Functions & API Routes ───────────────────────────────────────
+functions:
+  shorten:
+    handler: src/handlers/shorten.handler
+    events:
+      # httpApi is cheaper and faster than traditional REST APIs
+      - httpApi:
+          path: /shorten
+          method: post
+          
+  redirect:
+    handler: src/handlers/redirect.handler
+    events:
+      - httpApi:
+          path: /{id}
+          method: get
+          
+  analyticsWorker:
+    handler: src/handlers/analytics-worker.handler
+    events:
+      - sqs:
+          arn: !GetAtt AnalyticsQueue.Arn
+          batchSize: 10 # Pulls 10 clicks at a time to reduce DB writes
+
+# ─── 4. Cloud Infrastructure (DynamoDB & SQS) ───────────────────────────────
+resources:
+  Resources:
+    UrlTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.DYNAMODB_TABLE}
+        BillingMode: PAY_PER_REQUEST # CRITICAL for zero cost
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true # Free automatic deletion of expired links
+          
+    AnalyticsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-analytics-${sls:stage}
