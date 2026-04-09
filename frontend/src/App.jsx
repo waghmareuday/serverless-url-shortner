@@ -4,8 +4,9 @@ import { parse as parseDomain } from "tldts";
 // BUG FIX: removed the hardcoded production API Gateway URL fallback.
 // VITE_API_BASE_URL must be set at build time — an explicit error at startup
 // is far better than silently hitting the production endpoint from staging/preview.
-const _rawBase = import.meta.env.VITE_API_BASE_URL;
-if (!_rawBase) {
+const _rawBase = (import.meta.env.VITE_API_BASE_URL || "").trim();
+const _isDev = import.meta.env.DEV;
+if (!_isDev && !_rawBase) {
   throw new Error(
     "VITE_API_BASE_URL is not set. " +
     "Copy frontend/.env.example to frontend/.env.local and fill in the value."
@@ -39,9 +40,9 @@ export default function App() {
   const [isCacheProbeLoading, setIsCacheProbeLoading] = useState(false);
   const [cacheProbeNote, setCacheProbeNote] = useState("");
 
-  const normalizedBaseUrl = useMemo(() => _rawBase.replace(/\/+$/, ""), []);
+  const normalizedBaseUrl = useMemo(() => _rawBase.replace(/\/+$/, ""), [_rawBase]);
   const requestBaseUrl = useMemo(
-    () => (import.meta.env.DEV ? "/api" : normalizedBaseUrl),
+    () => (_isDev ? "/api" : normalizedBaseUrl),
     [normalizedBaseUrl]
   );
 
@@ -71,6 +72,7 @@ export default function App() {
   };
 
   const formatCacheBadge = (status) => {
+    if (status === "L0_HIT") return "Shorten Cache [ L0 Browser Hit ]";
     if (status === "L1_HIT") return "Redirect Cache [ L1 Memory Hit ]";
     if (status === "HIT")    return "Redirect Cache [ L2 Redis Hit ]";
     if (status === "MISS")   return "Redirect Cache [ MISS → DynamoDB ]";
@@ -123,14 +125,31 @@ export default function App() {
       return;
     }
 
-    setIsLoading(true);
+    const normalizedLongUrl = new URL(candidateUrl).toString();
     setShortLink("");
+
+    // L0 browser cache: avoid duplicate shorten API calls for the same URL on this device.
+    let cachedShortLink = null;
+    try {
+      cachedShortLink = localStorage.getItem(normalizedLongUrl);
+    } catch (storageReadErr) {
+      console.warn("[ui] Could not read localStorage cache:", storageReadErr?.message);
+    }
+
+    if (cachedShortLink) {
+      setShortLink(cachedShortLink);
+      setCacheStatus("L0_HIT");
+      setIsLoading(false);
+      return;
+    }
+
+    setIsLoading(true);
 
     try {
       const res = await fetch(`${requestBaseUrl}/shorten`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: candidateUrl }),
+        body: JSON.stringify({ url: normalizedLongUrl }),
       });
 
       const payload = await res.json().catch(() => ({}));
@@ -150,6 +169,12 @@ export default function App() {
       }
 
       setShortLink(resolvedLink);
+      try {
+        localStorage.setItem(normalizedLongUrl, resolvedLink);
+      } catch (storageWriteErr) {
+        console.warn("[ui] Could not write localStorage cache:", storageWriteErr?.message);
+      }
+
       if (shortId) void probeCacheStatus(shortId);
 
     } catch (requestErr) {
