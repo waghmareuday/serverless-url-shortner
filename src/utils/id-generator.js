@@ -83,7 +83,8 @@ class SnowflakeGenerator {
       this.#sequence = (this.#sequence + 1n) & MAX_SEQUENCE;
 
       if (this.#sequence === 0n) {
-        timestamp = this.#waitNextMillis(this.#lastTimestamp);
+        console.warn("[id-generator] Sequence exhausted for current second; waiting for next second.");
+        timestamp = this.#waitNextSecond(this.#lastTimestamp);
       }
     } else {
       this.#sequence = 0n;
@@ -120,7 +121,7 @@ class SnowflakeGenerator {
     return BigInt(Math.floor(Date.now() / 1000));
   }
 
-  #waitNextMillis(lastTimestamp) {
+  #waitNextSecond(lastTimestamp) {
     let ts = this.#currentTime();
     while (ts <= lastTimestamp) {
       ts = this.#currentTime();

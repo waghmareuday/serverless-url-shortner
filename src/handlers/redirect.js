@@ -1,6 +1,7 @@
 import { getUrlWithCache } from "../services/cache.js";
 import { enqueueClickEvent } from "../services/sqs.js";
 import { mightExist } from "../services/bloomFilter.js";
+import { hashIp } from "../utils/ip-hash.js";
 
 const REDIRECT_STATUS = parseInt(process.env.REDIRECT_STATUS_CODE || "301", 10);
 
@@ -19,7 +20,14 @@ export const handler = async (event) => {
     
   try {
     // ── 1.5. Bloom Filter Gate ──────────────────────────────────────────────
-    const probablyExists = await mightExist(id);
+      let probablyExists = true;
+      try {
+        probablyExists = await mightExist(id);
+      } catch (err) {
+        // Bloom filter is an optimization only; fail open and continue to DB/cache.
+        console.error("[redirect] Bloom filter unavailable, continuing with lookup:", err);
+        probablyExists = true;
+      }
 
     if (!probablyExists) {
     return {
@@ -40,13 +48,13 @@ export const handler = async (event) => {
     }
 
     // ── 3. Fire Asynchronous Analytics to SQS 
-    // We capture basic request data. In a real system, you'd hash the IP for GDPR.
     const ip = event.requestContext?.http?.sourceIp || "unknown";
+    const ipHash = hashIp(ip);
     const userAgent = event.headers?.["user-agent"] || "unknown";
     
-    await enqueueClickEvent({
+    void enqueueClickEvent({
       id,
-      ip,
+      ipHash,
       userAgent,
       timestamp: Date.now()
     });

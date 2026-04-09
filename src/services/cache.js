@@ -35,7 +35,9 @@ export async function getUrlWithCache(id) {
       localCache.set(id, cached);
       return { url: cached, cacheStatus: 'HIT' };
     }
-  } catch (cacheErr) {}
+  } catch (cacheErr) {
+    console.warn("[cache] Redis error, falling back to DynamoDB:", cacheErr?.message || cacheErr);
+  }
 
   const url = await fetchFromDynamo(id);
   if (!url) return { url: null, cacheStatus: 'MISS' };

@@ -8,7 +8,12 @@ const client = new DynamoDBClient({ region: process.env.AWS_REGION || "ap-south-
 const dynamo = DynamoDBDocumentClient.from(client);
 
 // Export the table name and the live client
-export const TABLE = process.env.DYNAMODB_TABLE;
+const tableName = process.env.DYNAMODB_TABLE;
+if (!tableName) {
+	throw new Error("DYNAMODB_TABLE env var is required");
+}
+
+export const TABLE = tableName;
 export default dynamo;
 
 // (Keep your CREATE_TABLE_PARAMS from Phase 1 down here as a reference, 

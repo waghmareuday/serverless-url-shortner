@@ -35,6 +35,11 @@ This project implements a fully managed serverless infrastructure, utilizing **A
 * **Fixed-Window IP Rate Limiting**  
   Custom Redis-backed rate limiter effectively defends against malicious bot attacks and brute-force traffic by strictly enforcing quota limits per origin IP address.
 
+* **Latency-Safe URL Validation Strategy**  
+  We avoid synchronous URL reachability checks on the write path because they add latency, fail on auth-gated destinations, and do not scale. Instead:
+  - Frontend performs instant structural validation with `new URL()`.
+  - Backend enqueues asynchronous URL safety scans using Google Safe Browsing (post-write worker), preserving low p95 latency on `POST /shorten`.
+
 ---
 
 ## 📊 Performance & Load Testing
@@ -63,6 +68,7 @@ During extreme peak load testing, the system demonstrated exceptional architectu
 - Serverless Framework (`npm install -g serverless`)
 - AWS Credentials configured locally
 - Upstash Redis Connection String
+- Google Safe Browsing API key (`SAFE_BROWSING_API_KEY`)
 
 ### Setup
 ```bash

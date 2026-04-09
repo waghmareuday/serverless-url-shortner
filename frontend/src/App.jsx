@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { parse as parseDomain } from "tldts";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "https://1qlfu0ouhd.execute-api.ap-south-1.amazonaws.com";
@@ -26,6 +27,9 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
+  const [cacheStatus, setCacheStatus] = useState("");
+  const [isCacheProbeLoading, setIsCacheProbeLoading] = useState(false);
+  const [cacheProbeNote, setCacheProbeNote] = useState("");
 
   const normalizedBaseUrl = useMemo(() => API_BASE_URL.replace(/\/+$/, ""), []);
   const requestBaseUrl = useMemo(
@@ -33,26 +37,97 @@ export default function App() {
     [normalizedBaseUrl]
   );
 
+  const hasScheme = (value) => /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(value);
+
+  const hasMalformedWwwPrefix = (hostname) => {
+    const firstLabel = hostname.split(".")[0]?.toLowerCase() || "";
+    return firstLabel.startsWith("www") && firstLabel !== "www";
+  };
+
+  const isValidPublicUrl = (raw) => {
+    try {
+      const parsed = new URL(raw);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        return false;
+      }
+
+      const hostname = parsed.hostname.toLowerCase();
+      if (!hostname || hostname === "localhost" || hostname.endsWith(".")) {
+        return false;
+      }
+
+      if (hasMalformedWwwPrefix(hostname)) {
+        return false;
+      }
+
+      // Structural-only validation: no synchronous reachability check.
+      const domainInfo = parseDomain(hostname, { allowPrivateDomains: true });
+      if (domainInfo.isIp || !domainInfo.domain || !domainInfo.publicSuffix) {
+        return false;
+      }
+
+      return domainInfo.isIcann || domainInfo.isPrivate;
+    } catch {
+      return false;
+    }
+  };
+
+  const formatCacheBadge = (status) => {
+    if (status === "L1_HIT") return "Redirect Cache [ L1 Memory Hit ]";
+    if (status === "HIT") return "Redirect Cache [ L2 Redis Hit ]";
+    if (status === "MISS") return "Redirect Cache [ MISS -> DynamoDB ]";
+    return status ? `Redirect Cache [ ${status} ]` : "";
+  };
+
+  async function probeCacheStatus(shortId) {
+    setIsCacheProbeLoading(true);
+    setCacheProbeNote("");
+
+    try {
+      const response = await fetch(`${requestBaseUrl}/cache-status/${encodeURIComponent(shortId)}`, {
+        method: "GET",
+      });
+
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(payload?.error || `Cache probe failed (${response.status}).`);
+      }
+
+      const rawCacheStatus = payload?.cacheStatus || "";
+      const normalized = String(rawCacheStatus).trim().toUpperCase();
+      setCacheStatus(normalized);
+      if (!normalized) {
+        setCacheProbeNote("Cache status unavailable right now.");
+      }
+    } catch (probeError) {
+      console.warn("[ui] Could not probe redirect cache status:", probeError?.message || probeError);
+      setCacheStatus("");
+      setCacheProbeNote("Cache status unavailable right now.");
+    } finally {
+      setIsCacheProbeLoading(false);
+    }
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
 
     const input = longUrl.trim();
     setCopied(false);
     setError("");
+    setCacheStatus("");
+    setIsCacheProbeLoading(false);
+    setCacheProbeNote("");
 
     if (!input) {
       setError("Please enter a URL to shorten.");
       return;
     }
 
-    try {
-      const parsed = new URL(input);
-      if (!["http:", "https:"].includes(parsed.protocol)) {
-        setError("Please use a valid http:// or https:// URL.");
-        return;
-      }
-    } catch {
-      setError("Please enter a valid URL, for example: https://example.com/page");
+    const candidateUrl = hasScheme(input) ? input : `https://${input}`;
+
+    if (!isValidPublicUrl(candidateUrl)) {
+      setError("Please enter a valid public URL, for example: https://example.com/page");
       return;
     }
 
@@ -65,7 +140,7 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ url: input }),
+        body: JSON.stringify({ url: candidateUrl }),
       });
 
       const payload = await response.json().catch(() => ({}));
@@ -83,6 +158,10 @@ export default function App() {
       }
 
       setShortLink(resolvedLink);
+
+      if (shortId) {
+        void probeCacheStatus(shortId);
+      }
     } catch (requestError) {
       const message =
         requestError?.message === "Failed to fetch"
@@ -363,7 +442,7 @@ export default function App() {
             <div className="row">
               <input
                 className="url-input"
-                type="url"
+                type="text"
                 value={longUrl}
                 onChange={(event) => setLongUrl(event.target.value)}
                 placeholder="https://paste-your-long-link-here.com"
@@ -398,7 +477,9 @@ export default function App() {
                   <span className="copy-label">{copied ? "Copied" : "Copy"}</span>
                 </button>
               </div>
-              <div className="badge"> Blazing Fast Redirect [ L2 Redis Cache Active ] </div>
+              {isCacheProbeLoading ? <div className="badge">Checking redirect cache...</div> : null}
+              {!isCacheProbeLoading && cacheStatus ? <div className="badge">{formatCacheBadge(cacheStatus)}</div> : null}
+              {!isCacheProbeLoading && !cacheStatus && cacheProbeNote ? <div className="badge">{cacheProbeNote}</div> : null}
             </section>
           ) : null}
         </main>

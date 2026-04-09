@@ -4,13 +4,41 @@ import dynamo, { TABLE } from "../config/dynamo-schema.js";
 import { checkRateLimit } from "../services/rateLimiter.js";
 import { warmCache } from "../services/cache.js";
 import { addToBloomFilter } from "../services/bloomFilter.js";
+import { enqueueUrlSafetyCheck } from "../services/sqs.js";
+import { parse as parseDomain } from "tldts";
 
-const REDIRECT_STATUS = parseInt(process.env.REDIRECT_STATUS_CODE || "301", 10);
+const DEFAULT_URL_TTL_DAYS = 90;
+const URL_TTL_DAYS = Number.parseInt(process.env.URL_TTL_DAYS || `${DEFAULT_URL_TTL_DAYS}`, 10);
+const URL_TTL_SECONDS = (Number.isFinite(URL_TTL_DAYS) && URL_TTL_DAYS > 0 ? URL_TTL_DAYS : DEFAULT_URL_TTL_DAYS) * 86400;
+
+function hasMalformedWwwPrefix(hostname) {
+  const firstLabel = hostname.split(".")[0]?.toLowerCase() || "";
+  return firstLabel.startsWith("www") && firstLabel !== "www";
+}
 
 function isValidUrl(raw) {
   try {
-    const { protocol } = new URL(raw);
-    return protocol === "http:" || protocol === "https:";
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+
+    const hostname = parsed.hostname.toLowerCase();
+    if (!hostname || hostname === "localhost" || hostname.endsWith(".")) {
+      return false;
+    }
+
+    if (hasMalformedWwwPrefix(hostname)) {
+      return false;
+    }
+
+    // Structural-only validation: no synchronous reachability check.
+    const domainInfo = parseDomain(hostname, { allowPrivateDomains: true });
+    if (domainInfo.isIp || !domainInfo.domain || !domainInfo.publicSuffix) {
+      return false;
+    }
+
+    return domainInfo.isIcann || domainInfo.isPrivate;
   } catch {
     return false;
   }
@@ -26,10 +54,8 @@ function response(statusCode, body, extraHeaders = {}) {
 
 export const handler = async (event) => {
   const ip =
-    event.headers?.["x-test-ip"] || 
     event.requestContext?.http?.sourceIp ||
     event.requestContext?.identity?.sourceIp ||
-    event.headers?.["x-forwarded-for"]?.split(",")[0].trim() ||
     "unknown";
 
   const rl = await checkRateLimit(ip);
@@ -70,21 +96,25 @@ export const handler = async (event) => {
   if (!isValidUrl(trimmedUrl)) {
     return response(
       400,
-      { error: "Invalid URL. Must be an absolute http:// or https:// URL." },
+      { error: "Invalid URL. Must be an absolute http:// or https:// URL with a public domain." },
       rlHeaders
     );
   }
 
   try {
-    const id = generateId(); 
+    const id = generateId();
+    const createdAt = Date.now();
+    const expiresAt = Math.floor(createdAt / 1000) + URL_TTL_SECONDS;
 
     const record = {
-      PK: `URL#${id}`,       
-      SK: "META",            
+      PK: `URL#${id}`,
+      SK: "META",
       id,
       originalUrl: trimmedUrl,
-      createdAt: Date.now(),
-      clickCount: 0          
+      createdAt,
+      expiresAt,
+      safetyStatus: "PENDING",
+      clickCount: 0
     };
 
     await dynamo.send(
@@ -95,10 +125,17 @@ export const handler = async (event) => {
       })
     );
 
-    await Promise.all([
-      addToBloomFilter(id).catch(e => console.error("Bloom Error:", e)),
-      warmCache(id, trimmedUrl).catch(e => console.error("Cache Warmer Error:", e))
-    ]);
+    void Promise.resolve()
+      .then(() => addToBloomFilter(id))
+      .catch((e) => console.error("Bloom Error:", e));
+
+    void Promise.resolve()
+      .then(() => warmCache(id, trimmedUrl))
+      .catch((e) => console.error("Cache Warmer Error:", e));
+
+    void Promise.resolve()
+      .then(() => enqueueUrlSafetyCheck({ id, url: trimmedUrl, createdAt }))
+      .catch((e) => console.error("URL Safety Enqueue Error:", e));
 
     const domain = event.requestContext?.domainName;
     const baseUrl = domain 

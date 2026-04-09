@@ -49,6 +49,17 @@ export async function mightExist(shortCode) {
     pipeline.getbit(BLOOM_KEY, pos);
   }
   const results = await pipeline.exec();
-  // Upstash Redis returns a simple array of results, not [err, val] pairs.
-  return results.every((bit) => bit === 1);
+  // Upstash returns [val, val, ...] while ioredis commonly returns [[err, val], ...].
+  const normalizedBits = results.map((bit) => {
+    if (Array.isArray(bit)) {
+      const [err, val] = bit;
+      if (err) {
+        throw err;
+      }
+      return val;
+    }
+    return bit;
+  });
+
+  return normalizedBits.every((bit) => Number(bit) === 1);
 }

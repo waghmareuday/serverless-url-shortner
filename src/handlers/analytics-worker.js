@@ -1,6 +1,7 @@
 import { PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import dynamo, { TABLE } from "../config/dynamo-schema.js";
 import crypto from "crypto";
+import { hashIp } from "../utils/ip-hash.js";
 
 /**
  * SQS Consumer Lambda
@@ -16,11 +17,14 @@ import crypto from "crypto";
 export const handler = async (event) => {
   const records = event.Records || [];
   
-  if (records.length === 0) return;
+  if (records.length === 0) {
+    return { batchItemFailures: [] };
+  }
 
   const processMessage = async (record) => {
     const data = JSON.parse(record.body);
-    const { id, ip, userAgent, timestamp } = data;
+    const { id, ip, ipHash, userAgent, timestamp } = data;
+    const resolvedIpHash = ipHash || hashIp(ip);
 
     // Generate a short nonce to guarantee the Sort Key is unique
     const nonce = crypto.randomBytes(2).toString("hex");
@@ -32,7 +36,7 @@ export const handler = async (event) => {
         Item: {
           PK: `URL#${id}`,
           SK: `CLICK#${timestamp}#${nonce}`,
-          ip,
+          ipHash: resolvedIpHash,
           userAgent,
           createdAt: timestamp,
           // TTL: Purge clicks automatically after 1 year to save storage costs
@@ -59,16 +63,28 @@ export const handler = async (event) => {
     await Promise.all([putClick, incrementCounter]);
   };
 
-  // Process the entire batch concurrently
+  // Process the entire batch concurrently and report failed message IDs only.
   const results = await Promise.allSettled(records.map(processMessage));
+  const batchItemFailures = [];
 
-  // Check for any failures in the batch to trigger SQS retries
-  const failedCount = results.filter(r => r.status === "rejected").length;
-  if (failedCount > 0) {
-    console.error(`[analytics-worker] ${failedCount}/${records.length} messages failed to process.`);
-    // In a production app, you would use SQS Partial Batch Responses here
-    // to return the specific failed message IDs back to the queue.
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      const failedRecord = records[index];
+      if (failedRecord?.messageId) {
+        batchItemFailures.push({ itemIdentifier: failedRecord.messageId });
+      }
+      console.error("[analytics-worker] Failed message:", {
+        messageId: failedRecord?.messageId,
+        error: result.reason?.message || String(result.reason),
+      });
+    }
+  });
+
+  if (batchItemFailures.length > 0) {
+    console.error(
+      `[analytics-worker] ${batchItemFailures.length}/${records.length} messages failed and will be retried.`
+    );
   }
 
-  return { statusCode: 200 };
+  return { batchItemFailures };
 };
