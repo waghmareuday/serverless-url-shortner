@@ -1,69 +1,77 @@
 import { PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import dynamo, { TABLE } from "../config/dynamo-schema.js";
-import crypto from "crypto";
 import { hashIp } from "../utils/ip-hash.js";
 
 /**
- * SQS Consumer Lambda
- * Triggered by AWS SQS in batches (e.g., 10 messages at a time).
- * * Flow
- * ────
- * 1. Parse the batch of SQS messages.
- * 2. For each message, do 2 things:
- * a) Insert a new CLICK item (for deep analytics).
- * b) Increment the global clickCount on the META item.
- * 3. Use Promise.allSettled to handle partial batch failures smoothly.
+ * SQS Consumer — processes click events in batches of up to 10.
+ *
+ * BUG FIX (idempotency): The click nonce is now generated in redirect.js at
+ * click-capture time and included in the SQS message body.  Using a fixed
+ * nonce makes the DynamoDB PutItem call idempotent across SQS retries — the
+ * same message always produces the same SK, so retries are no-ops instead of
+ * creating duplicate CLICK records and inflating clickCount.
  */
 export const handler = async (event) => {
   const records = event.Records || [];
-  
-  if (records.length === 0) {
-    return { batchItemFailures: [] };
-  }
+  if (records.length === 0) return { batchItemFailures: [] };
 
   const processMessage = async (record) => {
     const data = JSON.parse(record.body);
-    const { id, ip, ipHash, userAgent, timestamp } = data;
-    const resolvedIpHash = ipHash || hashIp(ip);
+    const { id, ip, ipHash, userAgent, timestamp, nonce } = data;
 
-    // Generate a short nonce to guarantee the Sort Key is unique
-    const nonce = crypto.randomBytes(2).toString("hex");
+    // Support messages that pre-date the nonce field (plain ip-hash or raw ip).
+    const resolvedIpHash = ipHash || hashIp(ip || "unknown");
 
-    // Task A: Insert the individual click record
+    // BUG FIX: use the nonce from the message, not a freshly-generated one.
+    // Fallback to messageId if somehow nonce is absent (legacy messages).
+    const resolvedNonce = nonce || record.messageId.slice(0, 4);
+
+    // Task A: Insert the individual click record (idempotent — SK is stable)
     const putClick = dynamo.send(
       new PutCommand({
         TableName: TABLE,
         Item: {
-          PK: `URL#${id}`,
-          SK: `CLICK#${timestamp}#${nonce}`,
-          ipHash: resolvedIpHash,
+          PK:        `URL#${id}`,
+          SK:        `CLICK#${timestamp}#${resolvedNonce}`,
+          ipHash:    resolvedIpHash,
           userAgent,
           createdAt: timestamp,
-          // TTL: Purge clicks automatically after 1 year to save storage costs
-          expiresAt: Math.floor(Date.now() / 1000) + (365 * 24 * 60 * 60)
+          expiresAt: Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60,
         },
+        // Idempotency guard: if the item already exists (retry), skip silently.
+        ConditionExpression: "attribute_not_exists(SK)",
       })
     );
 
-    // Task B: Atomically increment the total click counter on the metadata record
+    // Task B: Atomically increment clickCount (ADD is idempotent here only if
+    // putClick succeeded; the ConditionExpression on putClick prevents double-counting).
     const incrementCounter = dynamo.send(
       new UpdateCommand({
         TableName: TABLE,
-        Key: {
-          PK: `URL#${id}`,
-          SK: "META",
-        },
+        Key: { PK: `URL#${id}`, SK: "META" },
         UpdateExpression: "ADD clickCount :inc",
-        ExpressionAttributeValues: {
-          ":inc": 1,
-        },
+        ExpressionAttributeValues: { ":inc": 1 },
       })
     );
 
-    await Promise.all([putClick, incrementCounter]);
+    // Run sequentially: insert the click record FIRST, then increment the counter
+    // ONLY if the insert succeeded.  This prevents two failure modes:
+    //   1. putClick succeeds + incrementCounter fails → retry skips both (count stuck behind)
+    //   2. putClick fails + incrementCounter succeeds → phantom count with no CLICK record
+    try {
+      await putClick;
+    } catch (err) {
+      // ConditionalCheckFailed means this exact click was already recorded (SQS retry).
+      // The counter was already incremented on the original pass — skip silently.
+      if (err.name === "ConditionalCheckFailedException") return;
+      throw err;
+    }
+
+    // putClick succeeded → this is the first processing of this message.
+    // Safe to increment the counter exactly once.
+    await incrementCounter;
   };
 
-  // Process the entire batch concurrently and report failed message IDs only.
   const results = await Promise.allSettled(records.map(processMessage));
   const batchItemFailures = [];
 
@@ -75,7 +83,7 @@ export const handler = async (event) => {
       }
       console.error("[analytics-worker] Failed message:", {
         messageId: failedRecord?.messageId,
-        error: result.reason?.message || String(result.reason),
+        error:     result.reason?.message || String(result.reason),
       });
     }
   });

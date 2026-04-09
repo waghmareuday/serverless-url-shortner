@@ -162,11 +162,17 @@ function fromBase62(str) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function nanoIdFallback(length = SHORT_CODE_LENGTH) {
-  const bytes = crypto.randomBytes(length * 2); 
-  let result  = "";
-  for (let i = 0; i < bytes.length && result.length < length; i++) {
-    const idx = bytes[i] % 62;
-    result += BASE62_CHARS[idx];
+  // Use rejection sampling to eliminate modulo bias.
+  // 248 is the largest multiple of 62 that fits in a byte (0–255).
+  // Bytes ≥ 248 are discarded; this wastes < 4% of entropy.
+  const REJECT_THRESHOLD = 248; // 62 * 4
+  let result = "";
+  while (result.length < length) {
+    const bytes = crypto.randomBytes((length - result.length) * 2);
+    for (let i = 0; i < bytes.length && result.length < length; i++) {
+      if (bytes[i] >= REJECT_THRESHOLD) continue; // reject biased byte
+      result += BASE62_CHARS[bytes[i] % 62];
+    }
   }
   return result;
 }

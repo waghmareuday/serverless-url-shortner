@@ -6,9 +6,11 @@ useDotenv: true
 provider:
   name: aws
   runtime: nodejs20.x
-  region: ap-south-1 # Deploys to Mumbai for lowest latency
-  memorySize: 256    # 256MB is plenty and maximizes your free tier compute
-  timeout: 10        # Kills the function after 10s if it hangs (saves money)
+  # arm64 (Graviton2) gives ~20% better throughput at ~20% lower cost.
+  # For 5M+ req/day this is meaningful savings with zero code changes.
+  architecture: arm64
+  region: ap-south-1
+  timeout: 10
   httpApi:
     cors:
       allowedOrigins:
@@ -24,17 +26,18 @@ provider:
         - X-Cache
       allowCredentials: false
       maxAge: 86400
-  
-  environment:
-    DYNAMODB_TABLE: ${self:service}-${sls:stage}
-    ANALYTICS_QUEUE_URL: !Ref AnalyticsQueue
-    URL_SAFETY_QUEUE_URL: !Ref UrlSafetyQueue
-    SAFE_BROWSING_API_KEY: ${env:SAFE_BROWSING_API_KEY}
-    # These must be set in your terminal before deploying
-    UPSTASH_REDIS_REST_URL: ${env:UPSTASH_REDIS_REST_URL}
-    UPSTASH_REDIS_REST_TOKEN: ${env:UPSTASH_REDIS_REST_TOKEN}
 
-  # ─── 2. Security (IAM Permissions) ────────────────────────────────────────
+  environment:
+    DYNAMODB_TABLE:           ${self:service}-${sls:stage}
+    ANALYTICS_QUEUE_URL:      !Ref AnalyticsQueue
+    URL_SAFETY_QUEUE_URL:     !Ref UrlSafetyQueue
+    SAFE_BROWSING_API_KEY:    ${env:SAFE_BROWSING_API_KEY}
+    UPSTASH_REDIS_REST_URL:   ${env:UPSTASH_REDIS_REST_URL}
+    UPSTASH_REDIS_REST_TOKEN: ${env:UPSTASH_REDIS_REST_TOKEN}
+    # Required: a secret random string for HMAC-based IP hashing.
+    # Generate with: openssl rand -hex 32
+    IP_HASH_SALT:             ${env:IP_HASH_SALT}
+
   iam:
     role:
       statements:
@@ -43,6 +46,8 @@ provider:
             - dynamodb:PutItem
             - dynamodb:GetItem
             - dynamodb:UpdateItem
+            # BUG FIX: DeleteItem was missing — needed to hard-remove unsafe/abusive URLs.
+            - dynamodb:DeleteItem
           Resource: !GetAtt UrlTable.Arn
         - Effect: Allow
           Action:
@@ -55,21 +60,32 @@ provider:
 functions:
   shorten:
     handler: src/handlers/shorten.handler
+    # 256 MB is sufficient for write-path work.
+    memorySize: 256
     events:
-      # httpApi is cheaper and faster than traditional REST APIs
       - httpApi:
           path: /shorten
           method: post
-          
+
   redirect:
     handler: src/handlers/redirect.handler
+    # 512 MB doubles the vCPU allocation vs 256 MB, cutting p99 latency on
+    # crypto (nonce generation, HMAC IP hash) and JSON work. On Graviton2,
+    # 512 MB is the sweet spot for this workload.
+    memorySize: 512
     events:
       - httpApi:
           path: /{id}
           method: get
+    # Provisioned concurrency eliminates cold-start latency on the hot path.
+    # 10 warm instances handle ~333 req/sec (at 30 ms avg), well above the
+    # ~58 req/sec average for 5M req/day with room for 5× traffic spikes.
+    # Adjust upward if you observe cold starts in CloudWatch.
+    provisionedConcurrency: 10
 
   stats:
     handler: src/handlers/stats.handler
+    memorySize: 256
     events:
       - httpApi:
           path: /stats/{id}
@@ -77,35 +93,47 @@ functions:
 
   cacheStatus:
     handler: src/handlers/cache-status.handler
+    memorySize: 256
     events:
       - httpApi:
           path: /cache-status/{id}
           method: get
-          
+
   analyticsWorker:
     handler: src/handlers/analytics-worker.handler
+    memorySize: 256
     events:
       - sqs:
           arn: !GetAtt AnalyticsQueue.Arn
-          batchSize: 10 # Pulls 10 clicks at a time to reduce DB writes
+          # batchSize 10 means one Lambda invocation writes up to 10 click
+          # records and 10 counter increments, dramatically reducing DynamoDB
+          # write costs at scale.
+          batchSize: 10
+          # maximumBatchingWindow lets SQS accumulate messages for up to N
+          # seconds before triggering the Lambda, improving batch fill rate
+          # and reducing invocation frequency at the cost of slight latency.
+          maximumBatchingWindow: 5
           functionResponseType: ReportBatchItemFailures
 
   urlSafetyWorker:
     handler: src/handlers/url-safety-worker.handler
+    memorySize: 256
+    # Safety checks call the external Google API — give them more time.
+    timeout: 29
     events:
       - sqs:
           arn: !GetAtt UrlSafetyQueue.Arn
           batchSize: 10
           functionResponseType: ReportBatchItemFailures
 
-# ─── 4. Cloud Infrastructure (DynamoDB & SQS) ───────────────────────────────
+# ─── 4. Cloud Infrastructure ─────────────────────────────────────────────────
 resources:
   Resources:
     UrlTable:
       Type: AWS::DynamoDB::Table
       Properties:
         TableName: ${self:provider.environment.DYNAMODB_TABLE}
-        BillingMode: PAY_PER_REQUEST # CRITICAL for zero cost
+        BillingMode: PAY_PER_REQUEST
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -118,12 +146,17 @@ resources:
             KeyType: RANGE
         TimeToLiveSpecification:
           AttributeName: expiresAt
-          Enabled: true # Free automatic deletion of expired links
-          
+          Enabled: true
+        # Point-in-time recovery: 35-day rolling backup window.
+        # Non-negotiable for any table storing customer data.
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+
     AnalyticsQueue:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-analytics-${sls:stage}
+        # VisibilityTimeout must be >= Lambda timeout * 6 (AWS recommendation).
         VisibilityTimeout: 60
         RedrivePolicy:
           deadLetterTargetArn: !GetAtt AnalyticsQueueDLQ.Arn
@@ -133,12 +166,15 @@ resources:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-analytics-dlq-${sls:stage}
+        # DLQ messages are retained for 14 days for investigation.
+        MessageRetentionPeriod: 1209600
 
     UrlSafetyQueue:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-url-safety-${sls:stage}
-        VisibilityTimeout: 60
+        # Give the safety worker Lambda (29s timeout) enough headroom.
+        VisibilityTimeout: 180
         RedrivePolicy:
           deadLetterTargetArn: !GetAtt UrlSafetyQueueDLQ.Arn
           maxReceiveCount: 3
@@ -147,3 +183,4 @@ resources:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-url-safety-dlq-${sls:stage}
+        MessageRetentionPeriod: 1209600

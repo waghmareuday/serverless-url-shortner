@@ -19,7 +19,15 @@ export async function checkRateLimit(ip) {
     pipeline.expire(key, Math.ceil(WINDOW_MS / 1000) * 2);
 
     const results = await pipeline.exec();
-    const count = results[0]; // INCR result
+
+    // Normalize: Upstash REST SDK returns bare values, but ioredis-compatible
+    // SDKs return [error, value] tuples. Handle both defensively.
+    const raw = results[0];
+    const count = typeof raw === "number"
+      ? raw
+      : Array.isArray(raw)
+        ? (raw[1] ?? raw[0])
+        : (raw?.result ?? Number(raw));
 
     if (count > LIMIT) {
       const retryAfterMs = WINDOW_MS - (now - windowStart);

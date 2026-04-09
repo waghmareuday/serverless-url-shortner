@@ -8,8 +8,9 @@ import { enqueueUrlSafetyCheck } from "../services/sqs.js";
 import { parse as parseDomain } from "tldts";
 
 const DEFAULT_URL_TTL_DAYS = 90;
-const URL_TTL_DAYS = Number.parseInt(process.env.URL_TTL_DAYS || `${DEFAULT_URL_TTL_DAYS}`, 10);
+const URL_TTL_DAYS    = Number.parseInt(process.env.URL_TTL_DAYS || `${DEFAULT_URL_TTL_DAYS}`, 10);
 const URL_TTL_SECONDS = (Number.isFinite(URL_TTL_DAYS) && URL_TTL_DAYS > 0 ? URL_TTL_DAYS : DEFAULT_URL_TTL_DAYS) * 86400;
+const WINDOW_MS       = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
 
 function hasMalformedWwwPrefix(hostname) {
   const firstLabel = hostname.split(".")[0]?.toLowerCase() || "";
@@ -18,25 +19,15 @@ function hasMalformedWwwPrefix(hostname) {
 
 function isValidUrl(raw) {
   try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return false;
-    }
+    const parsed   = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
 
     const hostname = parsed.hostname.toLowerCase();
-    if (!hostname || hostname === "localhost" || hostname.endsWith(".")) {
-      return false;
-    }
+    if (!hostname || hostname === "localhost" || hostname.endsWith(".")) return false;
+    if (hasMalformedWwwPrefix(hostname)) return false;
 
-    if (hasMalformedWwwPrefix(hostname)) {
-      return false;
-    }
-
-    // Structural-only validation: no synchronous reachability check.
     const domainInfo = parseDomain(hostname, { allowPrivateDomains: true });
-    if (domainInfo.isIp || !domainInfo.domain || !domainInfo.publicSuffix) {
-      return false;
-    }
+    if (domainInfo.isIp || !domainInfo.domain || !domainInfo.publicSuffix) return false;
 
     return domainInfo.isIcann || domainInfo.isPrivate;
   } catch {
@@ -53,17 +44,22 @@ function response(statusCode, body, extraHeaders = {}) {
 }
 
 export const handler = async (event) => {
-  const ip =
-    event.requestContext?.http?.sourceIp ||
-    event.requestContext?.identity?.sourceIp ||
-    "unknown";
+  const ip = event.requestContext?.http?.sourceIp ||
+             event.requestContext?.identity?.sourceIp ||
+             "unknown";
 
   const rl = await checkRateLimit(ip);
+
+  // BUG FIX: compute the actual end-of-window Unix timestamp, not "now + WINDOW_MS".
+  // The rate limiter uses Math.floor(now / WINDOW_MS) * WINDOW_MS as the window key,
+  // so the reset point is the *next* window boundary: ceil(now / WINDOW_MS) * WINDOW_MS.
+  const now          = Date.now();
+  const windowReset  = Math.ceil(now / WINDOW_MS) * WINDOW_MS;
 
   const rlHeaders = {
     "X-RateLimit-Limit":     rl.limit,
     "X-RateLimit-Remaining": rl.remaining,
-    "X-RateLimit-Reset":     Math.ceil((Date.now() + parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000")) / 1000),
+    "X-RateLimit-Reset":     Math.floor(windowReset / 1000), // Unix seconds
   };
 
   if (!rl.allowed) {
@@ -86,13 +82,11 @@ export const handler = async (event) => {
   }
 
   const { url } = body;
-
   if (!url || typeof url !== "string") {
     return response(400, { error: "Body must contain a 'url' string field." }, rlHeaders);
   }
 
   const trimmedUrl = url.trim();
-
   if (!isValidUrl(trimmedUrl)) {
     return response(
       400,
@@ -102,19 +96,19 @@ export const handler = async (event) => {
   }
 
   try {
-    const id = generateId();
+    const id        = generateId();
     const createdAt = Date.now();
     const expiresAt = Math.floor(createdAt / 1000) + URL_TTL_SECONDS;
 
     const record = {
-      PK: `URL#${id}`,
-      SK: "META",
+      PK:           `URL#${id}`,
+      SK:           "META",
       id,
-      originalUrl: trimmedUrl,
+      originalUrl:  trimmedUrl,
       createdAt,
       expiresAt,
       safetyStatus: "PENDING",
-      clickCount: 0
+      clickCount:   0,
     };
 
     await dynamo.send(
@@ -125,30 +119,29 @@ export const handler = async (event) => {
       })
     );
 
-    void Promise.resolve()
-      .then(() => addToBloomFilter(id))
-      .catch((e) => console.error("Bloom Error:", e));
+    // Fire-and-forget side-effects (simplified from void Promise.resolve().then() anti-pattern).
+    // Warm with PENDING status; safety worker will invalidate & re-warm once the check finishes.
+    addToBloomFilter(id)
+      .catch((e) => console.error("[shorten] Bloom error:", e));
 
-    void Promise.resolve()
-      .then(() => warmCache(id, trimmedUrl))
-      .catch((e) => console.error("Cache Warmer Error:", e));
+    warmCache(id, trimmedUrl, "PENDING")
+      .catch((e) => console.error("[shorten] Cache warm error:", e));
 
-    void Promise.resolve()
-      .then(() => enqueueUrlSafetyCheck({ id, url: trimmedUrl, createdAt }))
-      .catch((e) => console.error("URL Safety Enqueue Error:", e));
+    enqueueUrlSafetyCheck({ id, url: trimmedUrl, createdAt })
+      .catch((e) => console.error("[shorten] URL safety enqueue error:", e));
 
-    const domain = event.requestContext?.domainName;
-    const baseUrl = domain 
-      ? `https://${domain}` 
+    const domain  = event.requestContext?.domainName;
+    const baseUrl = domain
+      ? `https://${domain}`
       : (process.env.BASE_URL || "https://sho.rt");
 
     return response(
       201,
       {
         id,
-        shortUrl: `${baseUrl}/${id}`,
+        shortUrl:    `${baseUrl}/${id}`,
         originalUrl: trimmedUrl,
-        createdAt: record.createdAt,
+        createdAt:   record.createdAt,
       },
       rlHeaders
     );

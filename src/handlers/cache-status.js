@@ -1,9 +1,9 @@
 import { getUrlWithCache } from "../services/cache.js";
 
-function response(statusCode, body) {
+function response(statusCode, body, extraHeaders = {}) {
   return {
     statusCode,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
     body: JSON.stringify(body),
   };
 }
@@ -25,7 +25,7 @@ export const handler = async (event) => {
     return response(200, {
       id,
       cacheStatus,
-    });
+    }, { "X-Cache": cacheStatus });
   } catch (err) {
     console.error("[cache-status] Unhandled error:", err);
     return response(500, { error: "Internal Server Error" });
