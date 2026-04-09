@@ -77,11 +77,6 @@ functions:
       - httpApi:
           path: /{id}
           method: get
-    # Provisioned concurrency eliminates cold-start latency on the hot path.
-    # 10 warm instances handle ~333 req/sec (at 30 ms avg), well above the
-    # ~58 req/sec average for 5M req/day with room for 5× traffic spikes.
-    # Adjust upward if you observe cold starts in CloudWatch.
-    provisionedConcurrency: 10
 
   stats:
     handler: src/handlers/stats.handler
