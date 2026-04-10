@@ -56,8 +56,8 @@ async function processMessage(record) {
   const safetyStatus = isUnsafe ? "UNSAFE" : "SAFE";
   const checkedAt    = Date.now();
 
-  // Persist the result to DynamoDB.
-  await dynamo.send(
+  // Persist the result to DynamoDB and retrieve the tier for cache warming.
+  const updateResult = await dynamo.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { PK: `URL#${id}`, SK: "META" },
@@ -69,25 +69,22 @@ async function processMessage(record) {
         ":threatTypes": threatTypes,
       },
       ConditionExpression: "attribute_exists(PK)",
+      ReturnValues: "ALL_NEW",
     })
   );
 
-  // BUG FIX: update both cache layers so redirect.js immediately enforces the
-  // new status.  Without this, UNSAFE URLs remain serveable until the short
-  // PENDING TTL expires — a window of up to 30 seconds.
-  //
-  // For UNSAFE URLs: invalidate (evict) the cache so the next request reads
-  // fresh from DynamoDB and hits the safety gate.
-  //
-  // For SAFE URLs: warm the cache with the settled status and full TTL so the
-  // first redirect after the check is a fast L2 hit rather than a DynamoDB call.
+  const tier = updateResult.Attributes?.tier || "ANONYMOUS";
+
+  // Update both cache layers so redirect.js immediately enforces the new status.
+  // For UNSAFE: evict so the next request reads fresh from DynamoDB.
+  // For SAFE: warm with settled status and full TTL for fast L2 hits.
   if (isUnsafe) {
     await invalidateCache(id).catch((e) =>
       console.error("[url-safety-worker] Cache invalidation failed (non-fatal):", e.message)
     );
     console.warn("[url-safety-worker] Unsafe URL flagged and evicted from cache", { id, threatTypes });
   } else {
-    await warmCache(id, url.trim(), "SAFE").catch((e) =>
+    await warmCache(id, url.trim(), "SAFE", tier).catch((e) =>
       console.error("[url-safety-worker] Cache warm failed (non-fatal):", e.message)
     );
   }

@@ -1,16 +1,19 @@
-﻿import { PutCommand } from "@aws-sdk/lib-dynamodb";
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import { generateId } from "../utils/id-generator.js";
 import dynamo, { TABLE } from "../config/dynamo-schema.js";
 import { checkRateLimit } from "../services/rateLimiter.js";
 import { warmCache } from "../services/cache.js";
 import { addToBloomFilter } from "../services/bloomFilter.js";
 import { enqueueUrlSafetyCheck } from "../services/sqs.js";
+import { verifyAuth } from "../services/auth.js";
 import { parse as parseDomain } from "tldts";
 
-const DEFAULT_URL_TTL_DAYS = 90;
-const URL_TTL_DAYS    = Number.parseInt(process.env.URL_TTL_DAYS || `${DEFAULT_URL_TTL_DAYS}`, 10);
-const URL_TTL_SECONDS = (Number.isFinite(URL_TTL_DAYS) && URL_TTL_DAYS > 0 ? URL_TTL_DAYS : DEFAULT_URL_TTL_DAYS) * 86400;
-const WINDOW_MS       = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
+// ── Cost-Tiering TTL ────────────────────────────────────────────────────────
+// Anonymous links expire in 30 days to keep DynamoDB lean.
+// Premium links live forever (no expiresAt attribute).
+const ANON_TTL_DAYS    = 30;
+const ANON_TTL_SECONDS = ANON_TTL_DAYS * 86400;
+const WINDOW_MS        = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
 
 function hasMalformedWwwPrefix(hostname) {
   const firstLabel = hostname.split(".")[0]?.toLowerCase() || "";
@@ -50,16 +53,13 @@ export const handler = async (event) => {
 
   const rl = await checkRateLimit(ip);
 
-  // BUG FIX: compute the actual end-of-window Unix timestamp, not "now + WINDOW_MS".
-  // The rate limiter uses Math.floor(now / WINDOW_MS) * WINDOW_MS as the window key,
-  // so the reset point is the *next* window boundary: ceil(now / WINDOW_MS) * WINDOW_MS.
   const now          = Date.now();
   const windowReset  = Math.ceil(now / WINDOW_MS) * WINDOW_MS;
 
   const rlHeaders = {
     "X-RateLimit-Limit":     rl.limit,
     "X-RateLimit-Remaining": rl.remaining,
-    "X-RateLimit-Reset":     Math.floor(windowReset / 1000), // Unix seconds
+    "X-RateLimit-Reset":     Math.floor(windowReset / 1000),
   };
 
   if (!rl.allowed) {
@@ -81,7 +81,7 @@ export const handler = async (event) => {
     return response(400, { error: "Request body must be valid JSON." }, rlHeaders);
   }
 
-  const { url } = body;
+  const { url, expiresInDays } = body;
   if (!url || typeof url !== "string") {
     return response(400, { error: "Body must contain a 'url' string field." }, rlHeaders);
   }
@@ -95,21 +95,43 @@ export const handler = async (event) => {
     );
   }
 
+  // Validate optional expiration
+  if (expiresInDays !== undefined && (typeof expiresInDays !== "number" || expiresInDays < 1 || expiresInDays > 365)) {
+    return response(400, { error: "expiresInDays must be a number between 1 and 365." }, rlHeaders);
+  }
+
   try {
+    // ── 1. Authenticate (optional — fails open to ANONYMOUS) ──────────────
+    const { userId, tier } = await verifyAuth(event);
+
     const id        = generateId();
     const createdAt = Date.now();
-    const expiresAt = Math.floor(createdAt / 1000) + URL_TTL_SECONDS;
 
+    // ── 2. Build the DynamoDB record based on tier ────────────────────────
     const record = {
       PK:           `URL#${id}`,
       SK:           "META",
       id,
       originalUrl:  trimmedUrl,
       createdAt,
-      expiresAt,
+      tier,
       safetyStatus: "PENDING",
-      clickCount:   0,
     };
+
+    if (tier === "PREMIUM") {
+      // Premium: attach user, initialize analytics
+      record.userId     = userId;
+      record.clickCount = 0;
+      record.isActive   = true;
+      // Optional expiration for premium links (default: permanent)
+      if (expiresInDays) {
+        record.expiresAt = Math.floor(createdAt / 1000) + expiresInDays * 86400;
+      }
+    } else {
+      // Anonymous: 30-day TTL, initialize clickCount for direct counter increment
+      record.expiresAt  = Math.floor(createdAt / 1000) + ANON_TTL_SECONDS;
+      record.clickCount = 0;
+    }
 
     await dynamo.send(
       new PutCommand({
@@ -119,12 +141,11 @@ export const handler = async (event) => {
       })
     );
 
-    // Fire-and-forget side-effects (simplified from void Promise.resolve().then() anti-pattern).
-    // Warm with PENDING status; safety worker will invalidate & re-warm once the check finishes.
+    // ── 3. Fire-and-forget side effects ──────────────────────────────────
     addToBloomFilter(id)
       .catch((e) => console.error("[shorten] Bloom error:", e));
 
-    warmCache(id, trimmedUrl, "PENDING")
+    warmCache(id, trimmedUrl, "PENDING", tier)
       .catch((e) => console.error("[shorten] Cache warm error:", e));
 
     enqueueUrlSafetyCheck({ id, url: trimmedUrl, createdAt })
@@ -142,6 +163,8 @@ export const handler = async (event) => {
         shortUrl:    `${baseUrl}/${id}`,
         originalUrl: trimmedUrl,
         createdAt:   record.createdAt,
+        tier,
+        ...(userId ? { userId } : {}),
       },
       rlHeaders
     );

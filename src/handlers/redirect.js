@@ -1,21 +1,20 @@
+import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { checkL1, getUrlWithCache } from "../services/cache.js";
 import { enqueueClickEvent } from "../services/sqs.js";
 import { mightExist } from "../services/bloomFilter.js";
 import { hashIp } from "../utils/ip-hash.js";
+import dynamo, { TABLE } from "../config/dynamo-schema.js";
 import crypto from "crypto";
 
 // ── Config (resolved once at cold-start, not per-request) ────────────────────
 const ALLOWED_STATUS_CODES = new Set([301, 302]);
 const _rawCode = parseInt(process.env.REDIRECT_STATUS_CODE || "302", 10);
 
-// BUG FIX: validate the status code; default to 302 if invalid
 const REDIRECT_STATUS = ALLOWED_STATUS_CODES.has(_rawCode) ? _rawCode : 302;
 if (!ALLOWED_STATUS_CODES.has(_rawCode)) {
   console.warn(`[redirect] Invalid REDIRECT_STATUS_CODE "${_rawCode}", defaulting to 302`);
 }
 
-// BUG FIX: always add no-cache headers — 301s must not be permanently cached
-// because safetyStatus can change and URLs can be removed after the fact.
 const REDIRECT_EXTRA_HEADERS = {
   "Cache-Control": "no-store, no-cache",
   Pragma: "no-cache",
@@ -39,14 +38,13 @@ export const handler = async (event) => {
 
   try {
     // ── 1. L1 fast path (sync, zero network I/O) ─────────────────────────────
-    // BUG FIX: check L1 BEFORE the bloom filter so cache hits never pay the
-    // cost of a Redis round trip — the biggest hot-path gain at 5M+ req/day.
     const l1Item = checkL1(id);
     if (l1Item) {
       if (l1Item.safetyStatus === "UNSAFE") {
         return jsonReply(451, { error: "This URL has been flagged as unsafe." });
       }
-      fireAnalytics(event, id);
+      // Fire analytics based on tier
+      dispatchAnalytics(event, id, l1Item.tier);
       return buildRedirect(l1Item.url, "L1_HIT");
     }
 
@@ -55,7 +53,6 @@ export const handler = async (event) => {
     try {
       probablyExists = await mightExist(id);
     } catch (err) {
-      // Bloom filter is an optimisation only; fail open.
       console.error("[redirect] Bloom filter unavailable, continuing:", err.message);
     }
 
@@ -64,20 +61,19 @@ export const handler = async (event) => {
     }
 
     // ── 3. Full cache lookup: L2 Redis → DynamoDB ────────────────────────────
-    const { url, safetyStatus, cacheStatus } = await getUrlWithCache(id);
+    const { url, safetyStatus, tier, cacheStatus } = await getUrlWithCache(id);
 
     if (!url) {
       return jsonReply(404, { error: "Short URL not found." });
     }
 
     // ── 4. Safety gate ────────────────────────────────────────────────────────
-    // BUG FIX: actually enforce the safety check result written by url-safety-worker.
     if (safetyStatus === "UNSAFE") {
       return jsonReply(451, { error: "This URL has been flagged as unsafe." });
     }
 
-    // ── 5. Async analytics (fire-and-forget, non-blocking) ───────────────────
-    fireAnalytics(event, id);
+    // ── 5. Analytics dispatch (tier-aware) ────────────────────────────────────
+    dispatchAnalytics(event, id, tier);
 
     // ── 6. Redirect ───────────────────────────────────────────────────────────
     return buildRedirect(url, cacheStatus);
@@ -102,19 +98,42 @@ function buildRedirect(url, cacheStatus) {
   };
 }
 
-function fireAnalytics(event, id) {
-  // BUG FIX: generate the nonce HERE (at click time) so the same nonce is
-  // included in the SQS message body.  analytics-worker will use it as the
-  // DynamoDB sort-key suffix, making the PutItem idempotent across SQS retries.
-  const nonce     = crypto.randomBytes(2).toString("hex");
+/**
+ * Tier-aware analytics dispatch:
+ *
+ * PREMIUM:   Full analytics via SQS (click records + counter + UA/geo enrichment)
+ *            → Sends raw IP (not hashed) for geo-location lookup in analytics-worker
+ *
+ * ANONYMOUS: Lightweight direct DynamoDB counter increment only (no SQS, no click records)
+ *            → Costs $0.00000125 per click vs $0.0000057 for SQS+Lambda+DynamoDB
+ */
+function dispatchAnalytics(event, id, tier) {
   const ip        = event.requestContext?.http?.sourceIp || "unknown";
   const userAgent = event.headers?.["user-agent"] || "unknown";
+  const referer   = event.headers?.referer || event.headers?.Referer || "";
 
-  enqueueClickEvent({
-    id,
-    ipHash: hashIp(ip),
-    userAgent,
-    timestamp: Date.now(),
-    nonce,
-  }).catch((err) => console.error("[redirect] SQS enqueue error:", err.message));
+  if (tier === "PREMIUM") {
+    // Full analytics: send raw IP for geo-lookup in the worker
+    const nonce = crypto.randomBytes(2).toString("hex");
+    enqueueClickEvent({
+      id,
+      ip,                      // Raw IP for geo-lookup → hashed in analytics-worker
+      ipHash: hashIp(ip),      // Pre-computed hash as fallback
+      userAgent,
+      referer,
+      timestamp: Date.now(),
+      nonce,
+    }).catch((err) => console.error("[redirect] SQS enqueue error:", err.message));
+  } else {
+    // ANONYMOUS: cheap direct counter increment only
+    // No click records, no SQS, no Lambda invocation → minimal cost
+    dynamo.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { PK: `URL#${id}`, SK: "META" },
+        UpdateExpression: "ADD clickCount :inc",
+        ExpressionAttributeValues: { ":inc": 1 },
+      })
+    ).catch((err) => console.error("[redirect] Counter increment error:", err.message));
+  }
 }

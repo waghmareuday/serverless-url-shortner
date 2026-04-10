@@ -6,8 +6,6 @@ useDotenv: true
 provider:
   name: aws
   runtime: nodejs20.x
-  # arm64 (Graviton2) gives ~20% better throughput at ~20% lower cost.
-  # For 5M+ req/day this is meaningful savings with zero code changes.
   architecture: arm64
   region: ap-south-1
   timeout: 10
@@ -21,6 +19,8 @@ provider:
       allowedMethods:
         - GET
         - POST
+        - PUT
+        - DELETE
         - OPTIONS
       exposedResponseHeaders:
         - X-Cache
@@ -34,9 +34,10 @@ provider:
     SAFE_BROWSING_API_KEY:    ${env:SAFE_BROWSING_API_KEY}
     UPSTASH_REDIS_REST_URL:   ${env:UPSTASH_REDIS_REST_URL}
     UPSTASH_REDIS_REST_TOKEN: ${env:UPSTASH_REDIS_REST_TOKEN}
-    # Required: a secret random string for HMAC-based IP hashing.
-    # Generate with: openssl rand -hex 32
     IP_HASH_SALT:             ${env:IP_HASH_SALT}
+    # Clerk authentication keys
+    CLERK_PUBLISHABLE_KEY:    ${env:CLERK_PUBLISHABLE_KEY}
+    CLERK_SECRET_KEY:         ${env:CLERK_SECRET_KEY}
 
   iam:
     role:
@@ -46,9 +47,15 @@ provider:
             - dynamodb:PutItem
             - dynamodb:GetItem
             - dynamodb:UpdateItem
-            # BUG FIX: DeleteItem was missing — needed to hard-remove unsafe/abusive URLs.
             - dynamodb:DeleteItem
-          Resource: !GetAtt UrlTable.Arn
+            - dynamodb:Query
+          Resource:
+            - !GetAtt UrlTable.Arn
+            # Allow Query on GSI2-UserLinks for dashboard endpoints
+            - !Join
+              - ""
+              - - !GetAtt UrlTable.Arn
+                - "/index/*"
         - Effect: Allow
           Action:
             - sqs:SendMessage
@@ -60,7 +67,6 @@ provider:
 functions:
   shorten:
     handler: src/handlers/shorten.handler
-    # 256 MB is sufficient for write-path work.
     memorySize: 256
     events:
       - httpApi:
@@ -69,9 +75,6 @@ functions:
 
   redirect:
     handler: src/handlers/redirect.handler
-    # 512 MB doubles the vCPU allocation vs 256 MB, cutting p99 latency on
-    # crypto (nonce generation, HMAC IP hash) and JSON work. On Graviton2,
-    # 512 MB is the sweet spot for this workload.
     memorySize: 512
     events:
       - httpApi:
@@ -94,26 +97,45 @@ functions:
           path: /cache-status/{id}
           method: get
 
+  # ── Dashboard API (Premium users only) ─────────────────────────────────────
+  manageGetLinks:
+    handler: src/handlers/manage.handler
+    memorySize: 256
+    events:
+      - httpApi:
+          path: /user/links
+          method: get
+
+  manageUpdateLink:
+    handler: src/handlers/manage.handler
+    memorySize: 256
+    events:
+      - httpApi:
+          path: /user/links/{id}
+          method: put
+
+  manageGetLinkStats:
+    handler: src/handlers/manage.handler
+    memorySize: 512
+    timeout: 15
+    events:
+      - httpApi:
+          path: /user/links/{id}/stats
+          method: get
+
   analyticsWorker:
     handler: src/handlers/analytics-worker.handler
     memorySize: 256
     events:
       - sqs:
           arn: !GetAtt AnalyticsQueue.Arn
-          # batchSize 10 means one Lambda invocation writes up to 10 click
-          # records and 10 counter increments, dramatically reducing DynamoDB
-          # write costs at scale.
           batchSize: 10
-          # maximumBatchingWindow lets SQS accumulate messages for up to N
-          # seconds before triggering the Lambda, improving batch fill rate
-          # and reducing invocation frequency at the cost of slight latency.
           maximumBatchingWindow: 5
           functionResponseType: ReportBatchItemFailures
 
   urlSafetyWorker:
     handler: src/handlers/url-safety-worker.handler
     memorySize: 256
-    # Safety checks call the external Google API — give them more time.
     timeout: 29
     events:
       - sqs:
@@ -134,16 +156,34 @@ resources:
             AttributeType: S
           - AttributeName: SK
             AttributeType: S
+          # GSI2-UserLinks: partition by userId, sort by createdAt
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: N
         KeySchema:
           - AttributeName: PK
             KeyType: HASH
           - AttributeName: SK
             KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: GSI2-UserLinks
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: INCLUDE
+              NonKeyAttributes:
+                - id
+                - originalUrl
+                - clickCount
+                - isActive
+                - tier
         TimeToLiveSpecification:
           AttributeName: expiresAt
           Enabled: true
-        # Point-in-time recovery: 35-day rolling backup window.
-        # Non-negotiable for any table storing customer data.
         PointInTimeRecoverySpecification:
           PointInTimeRecoveryEnabled: true
 
@@ -151,7 +191,6 @@ resources:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-analytics-${sls:stage}
-        # VisibilityTimeout must be >= Lambda timeout * 6 (AWS recommendation).
         VisibilityTimeout: 60
         RedrivePolicy:
           deadLetterTargetArn: !GetAtt AnalyticsQueueDLQ.Arn
@@ -161,14 +200,12 @@ resources:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-analytics-dlq-${sls:stage}
-        # DLQ messages are retained for 14 days for investigation.
         MessageRetentionPeriod: 1209600
 
     UrlSafetyQueue:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-url-safety-${sls:stage}
-        # Give the safety worker Lambda (29s timeout) enough headroom.
         VisibilityTimeout: 180
         RedrivePolicy:
           deadLetterTargetArn: !GetAtt UrlSafetyQueueDLQ.Arn
