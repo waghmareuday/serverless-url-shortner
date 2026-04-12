@@ -1,5 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useMemo, useEffect, useCallback, useRef } from "react";
 import { useAuth } from "@clerk/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+
+const LINKS_QUERY_KEY = "user-links";
 
 /**
  * Custom hook that manages the authenticated user's link history.
@@ -10,20 +13,8 @@ import { useAuth } from "@clerk/react";
  *  - All API methods return { ok, error?, data? } for clean UI handling
  */
 export function useUserLinks(requestBaseUrl, normalizedBaseUrl) {
-  const { getToken, isSignedIn, isLoaded } = useAuth();
-  const [links, setLinks]         = useState([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError]         = useState(null);
-  const urlMapRef                 = useRef(new Map());
-
-  // Rebuild lookup map
-  useEffect(() => {
-    const map = new Map();
-    for (const link of links) {
-      if (link.originalUrl) map.set(link.originalUrl, link);
-    }
-    urlMapRef.current = map;
-  }, [links]);
+  const { getToken, isSignedIn, isLoaded, userId } = useAuth();
+  const queryClient = useQueryClient();
 
   // ── Stable auth header builder ─────────────────────────────────────────────
   // Use ref to avoid re-creating fetchLinks when getToken reference changes
@@ -46,64 +37,88 @@ export function useUserLinks(requestBaseUrl, normalizedBaseUrl) {
     return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   }, []); // stable — never changes
 
+  const queryKey = useMemo(
+    () => [LINKS_QUERY_KEY, userId || "anon", requestBaseUrl, normalizedBaseUrl],
+    [userId, requestBaseUrl, normalizedBaseUrl]
+  );
+
   // ── Fetch all links ────────────────────────────────────────────────────────
-  const fetchLinks = useCallback(async ({ silent = false } = {}) => {
-    if (!isSignedIn) return;
+  const fetchLinks = useCallback(async () => {
+    const headers = await buildHeaders();
 
-    if (!silent) setIsLoading(true);
-    setError(null);
+    const mergedLinks = [];
+    let nextToken = null;
 
-    try {
-      const headers = await buildHeaders();
+    do {
+      const qs = new URLSearchParams();
+      if (nextToken) qs.set("nextToken", nextToken);
 
-      const mergedLinks = [];
-      let nextToken = null;
+      const url = qs.toString()
+        ? `${requestBaseUrl}/user/links?${qs.toString()}`
+        : `${requestBaseUrl}/user/links`;
 
-      do {
-        const qs = new URLSearchParams();
-        if (nextToken) qs.set("nextToken", nextToken);
+      const res = await fetch(url, { headers, cache: "no-store" });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload?.error || `Failed (${res.status}).`);
 
-        const url = qs.toString()
-          ? `${requestBaseUrl}/user/links?${qs.toString()}`
-          : `${requestBaseUrl}/user/links`;
+      mergedLinks.push(...(payload.links || []));
+      nextToken = payload.nextToken || null;
+    } while (nextToken);
 
-        const res = await fetch(url, { headers, cache: "no-store" });
-        const payload = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(payload?.error || `Failed (${res.status}).`);
+    return mergedLinks.map((link) => ({
+      ...link,
+      shortUrl: link.shortUrl || `${normalizedBaseUrl}/${link.id}`,
+    }));
+  }, [buildHeaders, requestBaseUrl, normalizedBaseUrl]);
 
-        mergedLinks.push(...(payload.links || []));
-        nextToken = payload.nextToken || null;
-      } while (nextToken);
+  const {
+    data: links = [],
+    isLoading,
+    isFetching,
+    dataUpdatedAt,
+    error: linksError,
+    refetch,
+  } = useQuery({
+    queryKey,
+    queryFn: fetchLinks,
+    enabled: isLoaded && isSignedIn,
+    refetchInterval: false,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+    retry: 1,
+  });
 
-      setLinks(
-        mergedLinks.map((link) => ({
-          ...link,
-          shortUrl: link.shortUrl || `${normalizedBaseUrl}/${link.id}`,
-        }))
-      );
-
-      return { ok: true };
-    } catch (err) {
-      console.error("[useUserLinks] Fetch error:", err?.message);
-      setError(err?.message || "Failed to load your links.");
-      return { ok: false, error: err?.message || "Failed to load your links." };
-    } finally {
-      if (!silent) setIsLoading(false);
-    }
-  }, [isSignedIn, buildHeaders, requestBaseUrl, normalizedBaseUrl]);
-
-  // Auto-fetch on sign-in / clear on sign-out
   useEffect(() => {
-    if (isLoaded && isSignedIn) void fetchLinks();
-    if (isLoaded && !isSignedIn) { setLinks([]); setError(null); }
-  }, [isLoaded, isSignedIn, fetchLinks]);
+    if (isLoaded && !isSignedIn) {
+      queryClient.removeQueries({ queryKey: [LINKS_QUERY_KEY] });
+    }
+  }, [isLoaded, isSignedIn, queryClient]);
+
+  const urlMap = useMemo(() => {
+    const map = new Map();
+    for (const link of links) {
+      if (link.originalUrl) map.set(link.originalUrl, link);
+    }
+    return map;
+  }, [links]);
+
+  const refreshLinks = useCallback(async () => {
+    const result = await refetch();
+    if (result.error) {
+      return { ok: false, error: result.error?.message || "Failed to refresh links." };
+    }
+    return { ok: true, data: result.data || [] };
+  }, [refetch]);
 
   // ── Toggle isActive ────────────────────────────────────────────────────────
   const toggleLink = useCallback(async (id, currentIsActive) => {
-    // Optimistic UI update FIRST for instant feedback
-    setLinks((prev) =>
-      prev.map((l) => (l.id === id ? { ...l, isActive: !currentIsActive } : l))
+    const previousLinks = queryClient.getQueryData(queryKey) || [];
+    queryClient.setQueryData(queryKey, (prev = []) =>
+      prev.map((link) =>
+        link.id === id ? { ...link, isActive: !currentIsActive } : link
+      )
     );
+
     try {
       const headers = await buildHeaders();
       const res = await fetch(`${requestBaseUrl}/user/links/${id}`, {
@@ -113,20 +128,16 @@ export function useUserLinks(requestBaseUrl, normalizedBaseUrl) {
       });
       const payload = await res.json().catch(() => ({}));
       if (!res.ok) {
-        // Revert optimistic update on failure
-        setLinks((prev) =>
-          prev.map((l) => (l.id === id ? { ...l, isActive: currentIsActive } : l))
-        );
         throw new Error(payload?.error || `Toggle failed (${res.status}).`);
       }
 
-      // Pull latest server state so dashboard stays accurate without re-login.
-      await fetchLinks({ silent: true });
+      await refetch();
       return { ok: true };
     } catch (err) {
+      queryClient.setQueryData(queryKey, previousLinks);
       return { ok: false, error: err?.message };
     }
-  }, [buildHeaders, requestBaseUrl, fetchLinks]);
+  }, [buildHeaders, requestBaseUrl, queryClient, queryKey, refetch]);
 
   // ── Update link (reroute URL / set expiration) ─────────────────────────────
   const updateLink = useCallback(async (id, updates) => {
@@ -140,27 +151,25 @@ export function useUserLinks(requestBaseUrl, normalizedBaseUrl) {
       const payload = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(payload?.error || `Update failed (${res.status}).`);
 
-      // Update local state with server response
-      setLinks((prev) =>
-        prev.map((l) =>
-          l.id === id
+      queryClient.setQueryData(queryKey, (prev = []) =>
+        prev.map((link) =>
+          link.id === id
             ? {
-                ...l,
-                originalUrl: payload.originalUrl || l.originalUrl,
-                isActive:    payload.isActive ?? l.isActive,
-                expiresAt:   payload.expiresAt ?? l.expiresAt,
+                ...link,
+                originalUrl: payload.originalUrl || link.originalUrl,
+                isActive: payload.isActive ?? link.isActive,
+                expiresAt: payload.expiresAt ?? link.expiresAt,
               }
-            : l
+            : link
         )
       );
 
-      // Refresh from backend to avoid drift across tabs/sessions.
-      await fetchLinks({ silent: true });
+      await refetch();
       return { ok: true, data: payload };
     } catch (err) {
       return { ok: false, error: err?.message };
     }
-  }, [buildHeaders, requestBaseUrl, fetchLinks]);
+  }, [buildHeaders, requestBaseUrl, queryClient, queryKey, refetch]);
 
   // ── Fetch link stats ───────────────────────────────────────────────────────
   const fetchLinkStats = useCallback(async (id) => {
@@ -179,16 +188,21 @@ export function useUserLinks(requestBaseUrl, normalizedBaseUrl) {
   }, [buildHeaders, requestBaseUrl]);
 
   // ── Lookups ────────────────────────────────────────────────────────────────
-  const findByOriginalUrl = useCallback((url) => urlMapRef.current.get(url) || null, []);
-  const addLink = useCallback((link) => setLinks((prev) => [link, ...prev]), []);
+  const findByOriginalUrl = useCallback((url) => urlMap.get(url) || null, [urlMap]);
+
+  const addLink = useCallback((link) => {
+    queryClient.setQueryData(queryKey, (prev = []) => [link, ...prev]);
+  }, [queryClient, queryKey]);
 
   return {
     links,
     isLoading,
-    error,
+    isFetching,
+    lastUpdatedAt: dataUpdatedAt || null,
+    error: linksError?.message || null,
     findByOriginalUrl,
     addLink,
-    refreshLinks: fetchLinks,
+    refreshLinks,
     toggleLink,
     updateLink,
     fetchLinkStats,

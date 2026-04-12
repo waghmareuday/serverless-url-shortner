@@ -35,6 +35,9 @@ provider:
     UPSTASH_REDIS_REST_URL:   ${env:UPSTASH_REDIS_REST_URL}
     UPSTASH_REDIS_REST_TOKEN: ${env:UPSTASH_REDIS_REST_TOKEN}
     IP_HASH_SALT:             ${env:IP_HASH_SALT}
+    USER_LINKS_PAGE_SIZE:     ${env:USER_LINKS_PAGE_SIZE, '100'}
+    STATS_SAMPLE_LIMIT:       ${env:STATS_SAMPLE_LIMIT, '200'}
+    ANALYTICS_GEO_TIMEOUT_MS: ${env:ANALYTICS_GEO_TIMEOUT_MS, '900'}
     # Clerk authentication keys
     CLERK_PUBLISHABLE_KEY:    ${env:CLERK_PUBLISHABLE_KEY}
     CLERK_SECRET_KEY:         ${env:CLERK_SECRET_KEY}
@@ -46,6 +49,7 @@ provider:
           Action:
             - dynamodb:PutItem
             - dynamodb:GetItem
+            - dynamodb:BatchGetItem
             - dynamodb:UpdateItem
             - dynamodb:DeleteItem
             - dynamodb:Query
@@ -62,6 +66,15 @@ provider:
           Resource:
             - !GetAtt AnalyticsQueue.Arn
             - !GetAtt UrlSafetyQueue.Arn
+
+# Package only backend-relevant files to keep deploys fast.
+package:
+  patterns:
+    - '!frontend/**'
+    - '!.netlify/**'
+    - '!load-test.js'
+    - '!README.md'
+    - '!netlify.toml'
 
 # ─── 3. Lambda Functions & API Routes ───────────────────────────────────────
 functions:
@@ -129,8 +142,8 @@ functions:
     events:
       - sqs:
           arn: !GetAtt AnalyticsQueue.Arn
-          batchSize: 10
-          maximumBatchingWindow: 5
+          batchSize: 1
+          maximumBatchingWindow: 0
           functionResponseType: ReportBatchItemFailures
 
   urlSafetyWorker:

@@ -1,13 +1,50 @@
-import { QueryCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { QueryCommand, GetCommand, UpdateCommand, BatchGetCommand } from "@aws-sdk/lib-dynamodb";
 import dynamo, { TABLE } from "../config/dynamo-schema.js";
 import { verifyAuth } from "../services/auth.js";
 import { invalidateCache, warmCache } from "../services/cache.js";
 import { parse as parseDomain } from "tldts";
 
 const GSI2_NAME = "GSI2-UserLinks";
-const PAGE_SIZE = 25;
 const ID_RE     = /^[\w-]{1,32}$/;
 const MAX_EXPIRY_DAYS = 365;
+
+function clampInt(raw, fallback, min, max) {
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+const PAGE_SIZE = clampInt(process.env.USER_LINKS_PAGE_SIZE, 100, 25, 200);
+const STATS_SAMPLE_LIMIT = clampInt(process.env.STATS_SAMPLE_LIMIT, 200, 50, 500);
+
+async function batchGetMetaItems(keys) {
+  if (!keys.length) return [];
+
+  const collected = [];
+  let pendingKeys = keys;
+
+  // Retry unprocessed keys to maximize freshness under burst traffic.
+  for (let attempt = 0; pendingKeys.length > 0 && attempt < 4; attempt++) {
+    const out = await dynamo.send(
+      new BatchGetCommand({
+        RequestItems: {
+          [TABLE]: {
+            Keys: pendingKeys,
+            ConsistentRead: true,
+            ProjectionExpression: "PK, SK, id, originalUrl, clickCount, isActive, createdAt, expiresAt, tier",
+          },
+        },
+      })
+    );
+
+    const got = out.Responses?.[TABLE] || [];
+    if (got.length) collected.push(...got);
+
+    pendingKeys = out.UnprocessedKeys?.[TABLE]?.Keys || [];
+  }
+
+  return collected;
+}
 
 function response(statusCode, body) {
   return {
@@ -57,6 +94,8 @@ async function handleGetLinks(event, userId) {
     IndexName: GSI2_NAME,
     KeyConditionExpression: "userId = :uid",
     ExpressionAttributeValues: { ":uid": userId },
+    // Read all attributes projected on GSI2. Requesting non-projected attrs here
+    // causes DynamoDB ValidationException and bubbles up as 500.
     ScanIndexForward: false,
     Limit: PAGE_SIZE,
   };
@@ -67,15 +106,32 @@ async function handleGetLinks(event, userId) {
 
   const result = await dynamo.send(new QueryCommand(queryParams));
 
-  const links = (result.Items || []).map((item) => ({
-    id:          item.id || item.PK?.replace("URL#", ""),
-    originalUrl: item.originalUrl,
-    clickCount:  item.clickCount ?? 0,
-    isActive:    item.isActive ?? true,
-    createdAt:   item.createdAt,
-    expiresAt:   item.expiresAt || null,
-    tier:        item.tier || "PREMIUM",
-  }));
+  const seedItems = result.Items || [];
+  const metaKeys = seedItems
+    .map((item) => {
+      const id = item.id || item.PK?.replace("URL#", "");
+      return id ? { PK: `URL#${id}`, SK: "META" } : null;
+    })
+    .filter(Boolean);
+
+  const freshItems = await batchGetMetaItems(metaKeys);
+  const byPk = new Map(freshItems.map((item) => [item.PK, item]));
+
+  const links = seedItems.map((seed) => {
+    const id = seed.id || seed.PK?.replace("URL#", "");
+    const pk = id ? `URL#${id}` : seed.PK;
+    const item = byPk.get(pk) || seed;
+
+    return {
+      id:          item.id || item.PK?.replace("URL#", ""),
+      originalUrl: item.originalUrl,
+      clickCount:  item.clickCount ?? 0,
+      isActive:    item.isActive ?? true,
+      createdAt:   item.createdAt,
+      expiresAt:   item.expiresAt || null,
+      tier:        item.tier || "PREMIUM",
+    };
+  });
 
   const responseBody = { links };
 
@@ -231,12 +287,14 @@ async function handleGetLinkStats(event, userId) {
     new QueryCommand({
       TableName: TABLE,
       KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
+      ConsistentRead: true,
       ExpressionAttributeValues: {
         ":pk":     `URL#${id}`,
         ":prefix": "CLICK#",
       },
+      ProjectionExpression: "createdAt, country, countryCode, refererDomain, browser, os, device, city",
       ScanIndexForward: false,
-      Limit: 500,
+      Limit: STATS_SAMPLE_LIMIT,
     })
   );
 
@@ -273,8 +331,11 @@ async function handleGetLinkStats(event, userId) {
     devices[dev] = (devices[dev] || 0) + 1;
 
     // Daily clicks
-    const day = new Date(click.createdAt).toISOString().split("T")[0];
-    dailyClicks[day] = (dailyClicks[day] || 0) + 1;
+    const ts = Number(click.createdAt);
+    if (Number.isFinite(ts)) {
+      const day = new Date(ts).toISOString().split("T")[0];
+      dailyClicks[day] = (dailyClicks[day] || 0) + 1;
+    }
   }
 
   // Sort breakdowns by count descending

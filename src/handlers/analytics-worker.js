@@ -1,4 +1,4 @@
-import { PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import dynamo, { TABLE } from "../config/dynamo-schema.js";
 import { hashIp } from "../utils/ip-hash.js";
 import { parseUserAgent } from "../utils/ua-parser.js";
@@ -6,7 +6,11 @@ import { parseUserAgent } from "../utils/ua-parser.js";
 // ── Geo-IP lookup (best-effort, non-blocking) ────────────────────────────────
 // Uses ip-api.com free tier. Falls back gracefully on failure/timeout.
 // Batch support: up to 100 IPs per request — we batch the entire SQS batch.
-const GEO_TIMEOUT_MS = 2000;
+const GEO_TIMEOUT_MS = (() => {
+  const raw = Number.parseInt(process.env.ANALYTICS_GEO_TIMEOUT_MS || "900", 10);
+  if (!Number.isFinite(raw)) return 900;
+  return Math.min(2000, Math.max(300, raw));
+})();
 
 async function batchGeoLookup(ips) {
   const geoMap = new Map();
@@ -75,11 +79,9 @@ function extractRefererDomain(referer) {
  *  - Parsed User-Agent (browser, OS, device)
  *  - Referer domain
  *
- * BUG FIXES:
- *  1. Race condition — Promises are now truly sequential (putClick completes
- *     BEFORE incrementCounter is even created).
- *  2. Referer is now destructured and stored in the click record.
- *  3. Geo-location data is enriched from raw IP using ip-api.com batch endpoint.
+ * Notes:
+ *  - Redirect path now updates clickCount synchronously for freshness.
+ *  - Worker remains responsible for detailed click record enrichment only.
  */
 export const handler = async (event) => {
   const records = event.Records || [];
@@ -130,10 +132,7 @@ export const handler = async (event) => {
     // Enrich: Referer domain
     const refererDomain = extractRefererDomain(referer);
 
-    // ── Task A: Insert click record (idempotent via ConditionExpression) ────
-    // BUG FIX: Do NOT create incrementCounter Promise until putClick succeeds.
-    // Previously both Promises were created simultaneously, causing the
-    // increment to fire even when putClick was a retry (ConditionalCheckFailed).
+    // ── Insert click record (idempotent via ConditionExpression) ─────────────
     try {
       await dynamo.send(
         new PutCommand({
@@ -167,17 +166,6 @@ export const handler = async (event) => {
       if (err.name === "ConditionalCheckFailedException") return;
       throw err;
     }
-
-    // ── Task B: Increment clickCount (ONLY if putClick succeeded) ───────────
-    // Created AFTER putClick succeeds → no phantom increments on retries.
-    await dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE,
-        Key: { PK: `URL#${id}`, SK: "META" },
-        UpdateExpression: "ADD clickCount :inc",
-        ExpressionAttributeValues: { ":inc": 1 },
-      })
-    );
   };
 
   // ── 4. Execute all in parallel with per-message error isolation ────────────

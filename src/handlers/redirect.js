@@ -44,7 +44,7 @@ export const handler = async (event) => {
         return jsonReply(451, { error: "This URL has been flagged as unsafe." });
       }
       // Fire analytics based on tier
-      dispatchAnalytics(event, id, l1Item.tier);
+      await dispatchAnalytics(event, id, l1Item.tier);
       return buildRedirect(l1Item.url, "L1_HIT");
     }
 
@@ -73,7 +73,7 @@ export const handler = async (event) => {
     }
 
     // ── 5. Analytics dispatch (tier-aware) ────────────────────────────────────
-    dispatchAnalytics(event, id, tier);
+    await dispatchAnalytics(event, id, tier);
 
     // ── 6. Redirect ───────────────────────────────────────────────────────────
     return buildRedirect(url, cacheStatus);
@@ -98,6 +98,18 @@ function buildRedirect(url, cacheStatus) {
   };
 }
 
+async function incrementClickCount(id) {
+  await dynamo.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: `URL#${id}`, SK: "META" },
+      UpdateExpression: "ADD clickCount :inc",
+      ExpressionAttributeValues: { ":inc": 1 },
+      ConditionExpression: "attribute_exists(PK)",
+    })
+  );
+}
+
 /**
  * Tier-aware analytics dispatch:
  *
@@ -107,13 +119,20 @@ function buildRedirect(url, cacheStatus) {
  * ANONYMOUS: Lightweight direct DynamoDB counter increment only (no SQS, no click records)
  *            → Costs $0.00000125 per click vs $0.0000057 for SQS+Lambda+DynamoDB
  */
-function dispatchAnalytics(event, id, tier) {
+async function dispatchAnalytics(event, id, tier) {
   const ip        = event.requestContext?.http?.sourceIp || "unknown";
   const userAgent = event.headers?.["user-agent"] || "unknown";
   const referer   = event.headers?.referer || event.headers?.Referer || "";
 
+  try {
+    // Keep dashboard count fresh immediately after each redirect.
+    await incrementClickCount(id);
+  } catch (err) {
+    console.error("[redirect] Counter increment error:", err.message);
+  }
+
   if (tier === "PREMIUM") {
-    // Full analytics: send raw IP for geo-lookup in the worker
+    // Full analytics payload is still processed asynchronously for enrichment.
     const nonce = crypto.randomBytes(2).toString("hex");
     enqueueClickEvent({
       id,
@@ -124,16 +143,5 @@ function dispatchAnalytics(event, id, tier) {
       timestamp: Date.now(),
       nonce,
     }).catch((err) => console.error("[redirect] SQS enqueue error:", err.message));
-  } else {
-    // ANONYMOUS: cheap direct counter increment only
-    // No click records, no SQS, no Lambda invocation → minimal cost
-    dynamo.send(
-      new UpdateCommand({
-        TableName: TABLE,
-        Key: { PK: `URL#${id}`, SK: "META" },
-        UpdateExpression: "ADD clickCount :inc",
-        ExpressionAttributeValues: { ":inc": 1 },
-      })
-    ).catch((err) => console.error("[redirect] Counter increment error:", err.message));
   }
 }

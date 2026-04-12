@@ -42,6 +42,7 @@ export default function App() {
   const [actionError, setActionError]   = useState(null);
   const [actionSuccess, setActionSuccess] = useState(null);
   const [togglingId, setTogglingId]     = useState(null);
+  const [timeNow, setTimeNow]           = useState(() => Date.now());
 
   // Use refs for values needed in callbacks to avoid stale closures
   const editUrlRef    = useRef(editUrl);
@@ -55,9 +56,19 @@ export default function App() {
   const requestBaseUrl    = useMemo(() => (_isDev ? "/api" : normalizedBaseUrl), [normalizedBaseUrl]);
 
   const {
-    links: userLinks, isLoading: isLinksLoading, error: linksError, addLink, findByOriginalUrl,
+    links: userLinks, isLoading: isLinksLoading, isFetching: isLinksFetching, lastUpdatedAt, error: linksError, addLink, findByOriginalUrl,
     refreshLinks, toggleLink, updateLink, fetchLinkStats,
   } = useUserLinks(requestBaseUrl, normalizedBaseUrl);
+
+  useEffect(() => {
+    if (!isSignedIn) return;
+
+    const timer = setInterval(() => {
+      setTimeNow(Date.now());
+    }, 30000);
+
+    return () => clearInterval(timer);
+  }, [isSignedIn]);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
   const hasScheme       = (v) => /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(v);
@@ -76,6 +87,28 @@ export default function App() {
     const m = { L0_HIT: "L0 Browser", USER_DEDUP: "User Dedup", L1_HIT: "L1 Memory", HIT: "L2 Redis", MISS: "DynamoDB" };
     return m[s] ? `Cache [ ${m[s]} ]` : s ? `Cache [ ${s} ]` : "";
   };
+
+  const formatLastUpdated = (updatedAt) => {
+    if (!updatedAt) return "Waiting for first sync";
+
+    const diffMs = Math.max(0, timeNow - updatedAt);
+    if (diffMs < 15000) return "Updated just now";
+
+    const minutes = Math.floor(diffMs / 60000);
+    if (minutes < 1) return "Updated <1m ago";
+    if (minutes < 60) return `Updated ${minutes}m ago`;
+
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `Updated ${hours}h ago`;
+
+    const days = Math.floor(hours / 24);
+    return `Updated ${days}d ago`;
+  };
+
+  const lastUpdatedLabel = isLinksFetching ? "Syncing latest..." : formatLastUpdated(lastUpdatedAt);
+  const lastUpdatedTitle = lastUpdatedAt
+    ? `Last sync: ${new Date(lastUpdatedAt).toLocaleString()}`
+    : "No successful sync yet";
 
   // Flash success/error with auto-clear
   const flashSuccess = (msg) => {
@@ -189,24 +222,33 @@ export default function App() {
   }, [reloadStats]);
 
   const handleRefreshLinks = useCallback(async () => {
-    await refreshLinks();
-
-    const openId = expandedIdRef.current;
-    if (openId) {
-      await reloadStats(openId);
+    const refreshed = await refreshLinks();
+    if (!refreshed?.ok) {
+      flashError(refreshed?.error || "Failed to refresh links.");
+      return;
     }
-  }, [refreshLinks, reloadStats]);
 
-  useEffect(() => {
-    if (!isSignedIn || !expandedId) return;
+    const latestLinks = Array.isArray(refreshed.data) && refreshed.data.length
+      ? refreshed.data
+      : userLinks;
 
-    const id = expandedId;
-    const timer = setInterval(() => {
-      void reloadStats(id, { silent: true });
-    }, 10000);
+    if (!latestLinks.length) return;
 
-    return () => clearInterval(timer);
-  }, [isSignedIn, expandedId, reloadStats]);
+    const statResults = await Promise.allSettled(
+      latestLinks.map((link) => fetchLinkStats(link.id))
+    );
+
+    const merged = {};
+    statResults.forEach((result, idx) => {
+      if (result.status === "fulfilled" && result.value?.ok) {
+        merged[latestLinks[idx].id] = result.value.data;
+      }
+    });
+
+    if (Object.keys(merged).length > 0) {
+      setStatsData((prev) => ({ ...prev, ...merged }));
+    }
+  }, [refreshLinks, userLinks, fetchLinkStats]);
 
   // ── Geo flag emoji ─────────────────────────────────────────────────────
   const flag = (cc) => {
@@ -268,9 +310,14 @@ export default function App() {
           <section className="dash" id="dashboard-section">
             <div className="dash-head">
               <h2 className="dash-title"><LinkIcn size={18}/>My Links{userLinks.length > 0 && <span className="dash-n">({userLinks.length})</span>}</h2>
-              <button className="btn-sm" onClick={handleRefreshLinks} disabled={isLinksLoading} id="refresh-links-btn">
-                {isLinksLoading ? <><span className="spin spin--light"/>Loading…</> : "↻ Refresh"}
-              </button>
+              <div className="dash-controls">
+                <span className={`dash-updated${isLinksFetching ? " dash-updated--active" : ""}`} title={lastUpdatedTitle} aria-live="polite">
+                  <span className="dash-updated-dot"/>{lastUpdatedLabel}
+                </span>
+                <button className="btn-sm" onClick={handleRefreshLinks} disabled={isLinksFetching} id="refresh-links-btn" aria-busy={isLinksFetching}>
+                  {isLinksFetching ? <><span className="spin spin--light"/>Refreshing...</> : "Manual Refresh"}
+                </button>
+              </div>
             </div>
 
             {/* Action feedback */}
@@ -496,6 +543,13 @@ const CSS = `
 /* dashboard */
 .dash{width:100%;max-width:760px;margin-top:24px;animation:reveal .3s ease}
 .dash-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.dash-controls{display:flex;align-items:center;gap:8px}
+.dash-updated{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 10px;border-radius:999px;
+  border:1px solid var(--border);background:rgba(15,15,19,.65);color:var(--muted);font-size:.72rem;white-space:nowrap}
+.dash-updated-dot{width:7px;height:7px;border-radius:50%;background:#52525b;transition:background .16s,box-shadow .16s,transform .16s}
+.dash-updated--active .dash-updated-dot{background:var(--accent);box-shadow:0 0 0 3px rgba(129,140,248,.22);
+  animation:pulse .95s ease-in-out infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.18)}}
 .dash-title{margin:0;font-size:1.1rem;font-weight:700;display:inline-flex;align-items:center;gap:8px}
 .dash-title svg{color:var(--accent)}.dash-n{font-size:.76rem;color:var(--muted);font-weight:500}
 .empty{text-align:center;padding:32px 16px;color:var(--muted);font-size:.9rem}
@@ -566,6 +620,8 @@ const CSS = `
 @media(max-width:640px){
   .shell{padding:20px 16px 40px}.card{padding:20px}.input-row{grid-template-columns:1fr}
   .btn-primary{width:100%}.auth-bar{margin-bottom:16px}.stats-grid{grid-template-columns:1fr}
+  .dash-head{align-items:flex-start;gap:8px}.dash-controls{flex-direction:column;align-items:flex-end;gap:6px}
+  .dash-updated{font-size:.68rem}
   .recent-item{grid-template-columns:28px 1fr;gap:4px}.recent-ref,.recent-time{display:none}
 }
 `;
